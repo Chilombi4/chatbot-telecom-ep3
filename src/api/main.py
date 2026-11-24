@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from src.api.resilience import CircuitBreaker, CircuitOpenError
 
 # Configuración mediante variables de entorno
 API_SECRET_KEY = os.getenv("API_SECRET_KEY", "telecom-ep3-secret-2026")
@@ -19,6 +20,13 @@ USE_SAGEMAKER = os.getenv("USE_SAGEMAKER", "false").lower() == "true"
 SAGEMAKER_ENDPOINT = os.getenv("SAGEMAKER_ENDPOINT", "chatbot-telecom-endpoint-v1")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
+# Límite de tasa configurable (por defecto 30/minute por IP). Subirlo solo para pruebas de capacidad.
+RATE_LIMIT = os.getenv("RATE_LIMIT", "30/minute")
+CRM_FAILURE_THRESHOLD = int(os.getenv("CRM_FAILURE_THRESHOLD", "3"))
+CRM_RECOVERY_SECONDS = float(os.getenv("CRM_RECOVERY_SECONDS", "15"))
+
+# Circuit Breaker compartido para el CRM Siebel
+crm_breaker = CircuitBreaker(failure_threshold=CRM_FAILURE_THRESHOLD, recovery_timeout=CRM_RECOVERY_SECONDS)
 
 # Inicializar Rate Limiter (IE7: Seguridad)
 limiter = Limiter(key_func=get_remote_address)
@@ -31,12 +39,11 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# Cargar modelo local como respaldo cuando USE_SAGEMAKER=false
+# Modelo local: se carga siempre, sirve como motor (USE_SAGEMAKER=false) y como respaldo ante fallos de SageMaker
 local_pipeline = None
-if not USE_SAGEMAKER:
-    model_path = os.path.join(os.path.dirname(__file__), "../model/artifacts/model.joblib")
-    if os.path.exists(model_path):
-        local_pipeline = joblib.load(model_path)
+model_path = os.path.join(os.path.dirname(__file__), "../model/artifacts/model.joblib")
+if os.path.exists(model_path):
+    local_pipeline = joblib.load(model_path)
 
 sagemaker_runtime = boto3.client("sagemaker-runtime", region_name=AWS_REGION) if USE_SAGEMAKER else None
 
@@ -97,19 +104,36 @@ def sanitizar_pii(texto: str) -> tuple[str, list[str]]:
     return texto_limpio, detectados
 
 # --- Componente 2: Conector ACL CRM Siebel + Circuit Breaker ---
-def consultar_crm_siebel_acl(usuario_id: str, intencion: str, simular_fallo: bool = False) -> dict:
+def _llamar_crm_siebel(usuario_id: str, intencion: str, simular_fallo: bool) -> dict:
+    """Llamada al CRM (simulada). Con simular_fallo=True se comporta como un CRM caído."""
     if simular_fallo:
-        # Patrón Circuit Breaker abierto: entrega respuesta degradada sin colapsar el sistema
-        return {
-            "estado_crm": "CIRCUIT_BREAKER_OPEN",
-            "mensaje": "CRM Siebel no disponible temporalmente. Operando en modo contingencia."
-        }
+        raise ConnectionError("CRM Siebel no responde")
     return {
         "estado_crm": "CONNECTED_ACL",
         "cliente_id": usuario_id,
         "plan_activo": "Plan Fibra + Móvil 5G Full",
         "estado_cuenta": "Al día" if intencion != "estado_facturacion" else "Boleta emitida ($24.990)"
     }
+
+def consultar_crm_siebel_acl(usuario_id: str, intencion: str, simular_fallo: bool = False) -> dict:
+    """Consulta el CRM protegida por Circuit Breaker.
+
+    - CIRCUIT_BREAKER_OPEN: circuito abierto, la llamada se rechaza sin tocar el CRM.
+    - CRM_ERROR_DEGRADADO: la llamada falló (circuito aún cerrado o semiabierto); se responde en modo contingencia.
+    """
+    try:
+        return crm_breaker.call(_llamar_crm_siebel, usuario_id, intencion, simular_fallo)
+    except CircuitOpenError:
+        return {
+            "estado_crm": "CIRCUIT_BREAKER_OPEN",
+            "mensaje": "CRM Siebel no disponible temporalmente. Operando en modo contingencia."
+        }
+    except ConnectionError:
+        return {
+            "estado_crm": "CRM_ERROR_DEGRADADO",
+            "circuito": crm_breaker.state,
+            "mensaje": "CRM Siebel no respondió. Operando en modo contingencia."
+        }
 
 # --- Componente 3: Publicador de Eventos en RabbitMQ (Event-Driven) ---
 def publicar_evento_rabbitmq(evento: dict) -> bool:
@@ -129,20 +153,27 @@ def publicar_evento_rabbitmq(evento: dict) -> bool:
         return False
 
 # --- Componente 4: Motor de Inferencia (AWS SageMaker o Fallback Local) ---
+def _inferencia_local(texto_sanitizado: str) -> dict:
+    import sys
+    sys.path.append(os.path.join(os.path.dirname(__file__), "../model"))
+    from inference import predict_fn
+    return predict_fn(texto_sanitizado, local_pipeline)
+
 def ejecutar_inferencia(texto_sanitizado: str) -> dict:
     if USE_SAGEMAKER and sagemaker_runtime:
-        response = sagemaker_runtime.invoke_endpoint(
-            EndpointName=SAGEMAKER_ENDPOINT,
-            ContentType="application/json",
-            Body=json.dumps({"texto": texto_sanitizado})
-        )
-        return json.loads(response["Body"].read().decode("utf-8"))
-    else:
-        # Importar lógica idéntica a inference.py para pruebas locales sin costo AWS
-        import sys
-        sys.path.append(os.path.join(os.path.dirname(__file__), "../model"))
-        from inference import predict_fn
-        return predict_fn(texto_sanitizado, local_pipeline)
+        try:
+            response = sagemaker_runtime.invoke_endpoint(
+                EndpointName=SAGEMAKER_ENDPOINT,
+                ContentType="application/json",
+                Body=json.dumps({"texto": texto_sanitizado})
+            )
+            return json.loads(response["Body"].read().decode("utf-8"))
+        except Exception:
+            # Respaldo automático: si el endpoint no responde, se usa el modelo local empaquetado
+            if local_pipeline is None:
+                raise
+            return _inferencia_local(texto_sanitizado)
+    return _inferencia_local(texto_sanitizado)
 
 # --- Endpoints REST ---
 @app.get("/healthz", tags=["Observabilidad"])
@@ -150,11 +181,12 @@ def health_check():
     return {
         "status": "healthy",
         "modo_inferencia": "AWS_SAGEMAKER" if USE_SAGEMAKER else "LOCAL_FALLBACK",
+        "circuito_crm": crm_breaker.state,
         "endpoint": SAGEMAKER_ENDPOINT if USE_SAGEMAKER else "local_joblib"
     }
 
 @app.post("/v1/chat", response_model=ChatResponse, tags=["Orquestador IA"])
-@limiter.limit("30/minute")
+@limiter.limit(RATE_LIMIT)
 def procesar_mensaje(
     request: Request,
     payload: ChatRequest,

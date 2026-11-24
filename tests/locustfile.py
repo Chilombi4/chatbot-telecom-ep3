@@ -1,3 +1,4 @@
+import os
 import random
 from locust import HttpUser, task, between
 
@@ -15,7 +16,7 @@ class ChatbotUser(HttpUser):
     def enviar_consulta(self):
         self.client.post(
             "/v1/chat",
-            headers={"X-API-Key": "telecom-ep3-secret-2026"},
+            headers={"X-API-Key": os.getenv("API_SECRET_KEY", "telecom-ep3-secret-2026")},
             json={
                 "usuario_id": f"cli-{random.randint(1000, 9999)}",
                 "canal": random.choice(["whatsapp", "web", "app"]),

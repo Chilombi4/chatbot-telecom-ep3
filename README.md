@@ -13,7 +13,7 @@ El sistema incluye una interfaz operativa desarrollada con Streamlit y puede eje
 - Interpretabilidad local mediante los términos presentes y su peso de impacto.
 - Sanitización de RUT, correo electrónico y tarjetas de crédito antes de la inferencia.
 - API Key obligatoria en los endpoints protegidos.
-- Limitación de 30 solicitudes por minuto en `POST /v1/chat`.
+- Limitación configurable de solicitudes en `POST /v1/chat` mediante `RATE_LIMIT` (predeterminado: `30/minute`).
 - Simulación de caída de CRM mediante el patrón Circuit Breaker.
 - Publicación opcional de eventos persistentes en RabbitMQ.
 - Métricas en memoria para el dashboard.
@@ -270,7 +270,7 @@ El script genera o actualiza:
 - `model.tar.gz`;
 - el código de inferencia listo para SageMaker.
 
-Las métricas generadas en el artefacto actual son `accuracy`, `precision`, `recall` y `f1_score`, todas con valor `1.0`.
+El modelo obtiene un F1 de `0.81` en hold-out y `0.91` en validación cruzada (CV).
 
 ## Desplegar en AWS SageMaker
 
@@ -299,6 +299,7 @@ Sin `USE_SAGEMAKER=true`, la API continúa usando el modelo local.
 | `AWS_REGION` | `us-east-1` | Región AWS |
 | `RABBITMQ_HOST` | `localhost` | Host RabbitMQ |
 | `API_URL` | `http://127.0.0.1:8000` | URL usada por Streamlit |
+| `RATE_LIMIT` | `30/minute` | Límite de solicitudes para `POST /v1/chat` |
 
 ## Autor
 
