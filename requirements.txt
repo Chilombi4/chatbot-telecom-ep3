@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 pydantic
-scikit-learn==1.9.1
+scikit-learn==1.5.2
 joblib
 numpy
 pika
